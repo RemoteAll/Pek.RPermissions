@@ -1,0 +1,19 @@
+[package]
+name = "pek-rpermissions"
+version = "0.1.0"
+edition = "2024"
+description = "Pek 权限组装件（Rust）：JWT（与 C# Pek.Permissions/DHDeploy 同套方案；NewLife JwtBuilder 兼容、字节级互通）"
+authors = ["PeiKeSmart"]
+license = "MIT"
+
+[dependencies]
+# DH 基础库（加密原语：hmac_sha256 / base64url / fixed_time_eq 等，无需额外依赖）
+dhrust = { path = "../DH.RustBase" }
+serde_json = "1"
+chrono = "0.4"
+
+[profile.release]
+lto = "thin"
+strip = true
+# 启用增量编译：重打包时只重编改动部分（缓存在 target/*/release/incremental）
+incremental = true
