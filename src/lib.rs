@@ -1,6 +1,6 @@
 //! Pek.RPermissions（Rust 版权限组装件）：**与 C# 端（Pek.Permissions / DHDeploy）同套的 JWT 方案**。
 //!
-//! 定位（对齐 [`Pek.RAdmin`](https://codeup.aliyun.com) 的组装件模式）：凡"令牌需要与 C# 生态互认"
+//! 定位（对齐 `Pek.RAdmin` 的组装件模式）：凡"令牌需要与 C# 生态互认"
 //! 的 Rust 项目一律引入本库、勿逐仓复制实现；基础加密原语在 `dhrust::sign`，本库只承载权限体系约定。
 //!
 //! - [`jwt`]：NewLife `JwtBuilder` 兼容 JWT（HS256，字节级互通；C# 黄金样本固化在单测）；

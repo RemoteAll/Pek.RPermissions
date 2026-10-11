@@ -4,6 +4,8 @@
 //! - Header：`{"alg":"HS256"}`（紧凑 JSON、无 `typ`）；
 //! - Payload：紧凑 JSON；`exp` / `iat` 为 **Unix 秒**；键序不限（验证按令牌原文验签）；
 //! - 签名：`HMAC-SHA256(key = secret 的 UTF-8 字节, data = "header.payload")` → **base64url 无填充**；
+//!   验签与 C# 一致按**规范形态**比较：签名段必须是 URL 安全、无填充的原文（不接受 `=` 填充、空白或
+//!   标准字母表变体；2026-10-11 审计补强——容错解码曾使"换拼写"令牌验签通过但吊销名单对不上）；
 //! - Secret 配置格式 `算法:密钥`（按 `:` 分隔取第二段——与 C# `Split(':')[1]` 严格一致；**密钥不要包含冒号**）；
 //! - 时间检查与 C# `JwtBuilder.TryDecode` 一致：`now > exp` → 过期；`now < nbf` → 未生效（仅当声明存在）。
 //!
@@ -12,7 +14,7 @@
 use serde_json::{Map, Value, json};
 
 /// JWT 选项（对齐 C# `Pek.Security.JwtOptions` 的常用字段）。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JwtOptions {
     /// 密钥（格式「算法:密钥」，如 `HS256:xxxx`；密钥不要包含冒号）
     pub secret: String,
@@ -48,6 +50,19 @@ impl JwtOptions {
     }
 }
 
+/// 自定义 `Debug`：密钥脱敏（避免调试/日志输出泄露密钥；2026-10-11 审计加固）。
+impl std::fmt::Debug for JwtOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtOptions")
+            .field("secret", &"***")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("access_expire_minutes", &self.access_expire_minutes)
+            .field("refresh_expire_minutes", &self.refresh_expire_minutes)
+            .finish()
+    }
+}
+
 /// JWT 编解码器（HS256）。
 #[derive(Clone)]
 pub struct Jwt {
@@ -66,6 +81,9 @@ impl Jwt {
         }
         if !parts[0].eq_ignore_ascii_case("HS256") {
             return Err(format!("暂不支持的 JWT 算法：{}（当前仅 HS256）", parts[0]));
+        }
+        if parts[1].is_empty() {
+            return Err("JWT 密钥不能为空（对齐 C#「未设置密钥」）".to_string());
         }
         Ok(Self {
             key: parts[1].as_bytes().to_vec(),
@@ -105,7 +123,8 @@ impl Jwt {
         if let Some(aud) = &self.options.audience {
             map.entry("aud").or_insert(json!(aud));
         }
-        map.entry("exp").or_insert(json!(now + expire_minutes * 60));
+        map.entry("exp")
+            .or_insert(json!(now.saturating_add(expire_minutes.saturating_mul(60))));
         map.entry("iat").or_insert(json!(now));
         let header = r#"{"alg":"HS256"}"#;
         let payload =
@@ -138,6 +157,12 @@ impl Jwt {
             return Err("签名解码失败".to_string());
         };
         if !dhrust::sign::fixed_time_eq(&expect, &given) {
+            return Err("签名验证失败".to_string());
+        }
+        // 签名段必须为规范形态（URL 安全、无填充、无空白）——与 C#
+        // `enc(...).ToUrlBase64() == ts[2]` 的字符串精确比较口径一致；
+        // 否则"换拼写"的同一令牌会验签通过、却与吊销名单的键对不上（2026-10-11 审计补强）。
+        if dhrust::sign::base64_url_no_pad(&given) != segs[2] {
             return Err("签名验证失败".to_string());
         }
 
@@ -258,6 +283,7 @@ mod tests {
         assert!(Jwt::from_secret("hs256:key123").is_ok(), "算法大小写不敏感（对齐 C#）");
         assert!(Jwt::from_secret("no-colon").is_err());
         assert!(Jwt::from_secret("RS256:key123").is_err(), "暂不支持非 HS256");
+        assert!(Jwt::from_secret("HS256:").is_err(), "空密钥拒绝（对齐 C#「未设置密钥」）");
         // 与 C# Split(':')[1] 一致：密钥取第一个冒号后的第二段（故密钥不应含冒号）
         let jwt = Jwt::from_secret("HS256:part1:part2").unwrap();
         let mut claims = Map::new();
@@ -281,5 +307,49 @@ mod tests {
             "令牌未生效"
         );
         assert!(jwt.validate_at(&token, GOLDEN_IAT + 3600).is_ok());
+    }
+
+    #[test]
+    fn signature_must_be_canonical_like_csharp() {
+        let jwt = Jwt::from_secret(INTEROP_SECRET).unwrap();
+        let token = jwt.encode_at(&Map::new(), 120, GOLDEN_IAT);
+        assert!(jwt.validate_at(&token, GOLDEN_IAT + 1).is_ok());
+
+        // 补 `=` 填充 → 拒绝（C# 为字符串精确比较："S=" 与 "S" 不相等）
+        assert_eq!(
+            jwt.validate_at(&format!("{token}="), GOLDEN_IAT + 1).unwrap_err(),
+            "签名验证失败"
+        );
+        // 签名段插入空白 → 拒绝
+        let (h, rest) = token.split_once('.').unwrap();
+        let (p, s) = rest.split_once('.').unwrap();
+        let spaced = format!("{}\n{}", &s[..5], &s[5..]);
+        assert_eq!(
+            jwt.validate_at(&format!("{h}.{p}.{spaced}"), GOLDEN_IAT + 1).unwrap_err(),
+            "签名验证失败"
+        );
+        // 标准 Base64 字母表拼写（含填充）→ 拒绝（解码字节相同，但非规范形态）
+        let sig_bytes = dhrust::sign::base64_decode(s).unwrap();
+        let std_sig = dhrust::sign::base64_encode(&sig_bytes);
+        assert_ne!(std_sig, s, "标准字母表拼写必与 URL 安全原文不同（含填充）");
+        assert_eq!(
+            jwt.validate_at(&format!("{h}.{p}.{std_sig}"), GOLDEN_IAT + 1).unwrap_err(),
+            "签名验证失败"
+        );
+    }
+
+    #[test]
+    fn options_debug_redacts_secret() {
+        let options = JwtOptions::from_secret("HS256:super-secret-value");
+        let text = format!("{options:?}");
+        assert!(!text.contains("super-secret-value"), "Debug 输出不应包含密钥：{text}");
+    }
+
+    #[test]
+    fn expire_overflow_saturates() {
+        let jwt = Jwt::from_secret(INTEROP_SECRET).unwrap();
+        let token = jwt.encode_at(&Map::new(), i64::MAX, GOLDEN_IAT);
+        let claims = jwt.validate_at(&token, GOLDEN_IAT + 1).unwrap();
+        assert_eq!(claims.get("exp").and_then(|v| v.as_i64()), Some(i64::MAX));
     }
 }

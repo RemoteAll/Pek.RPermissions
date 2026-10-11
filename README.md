@@ -7,7 +7,7 @@
 
 | 模块 | 说明 |
 |---|---|
-| `jwt` | HS256 JWT——配置 `算法:密钥`（如 `HS256:xxxx`，密钥不要含冒号）；header `{"alg":"HS256"}`；签名 `HMAC-SHA256(secret, "header.payload")` + base64url 无填充；`exp/iat` 为 Unix 秒；`Jwt::{encode*, validate*}`（`*_at` 版本供测试注入时间） |
+| `jwt` | HS256 JWT——配置 `算法:密钥`（如 `HS256:xxxx`，密钥不要含冒号）；header `{"alg":"HS256"}`；签名 `HMAC-SHA256(secret, "header.payload")` + base64url 无填充；`exp/iat` 为 Unix 秒；`Jwt::{encode*, validate*}`（`*_at` 版本供测试注入时间）；验签与 C# 一致要求签名段为**规范形态**（URL 安全、无填充） |
 | `claims` | 标准 claims（`sub` / `name` / `from` / `clientType`）构造与解析（`Claims::admin/app` 快捷构造） |
 | `revoke` | 内存吊销名单（登出即失效；重启清空）；`TokenRevoker::revoke_with(&jwt, token)` 按 exp 保留 |
 
@@ -15,6 +15,13 @@
 
 - 黄金样本（C# `NewLife.Web.JwtBuilder` 实测生成）固化在 `jwt.rs` 单测（含过期/篡改/换密钥反证）；
 - 双向互签互验脚本：`Pek.RCard/tools/jwt-interop.ps1` → `=== JWT INTEROP PASSED ===`。
+
+## 安全说明（2026-10-11 审计补强）
+
+- 只按固定 HMAC-SHA256 验签、不读取 header 中的算法（规避 `alg=none` 类攻击）；验签比对为常量时间；
+- 签名段必须是**规范形态**（URL 安全、无填充、无空白）——与 C# `enc(...).ToUrlBase64() == ts[2]` 的字符串精确比较口径一致；
+- 空密钥在 `Jwt::new` 构造时拒绝（对齐 C#「未设置密钥」）；`JwtOptions` 的 `Debug` 输出对密钥脱敏；
+- 吊销名单按**规范化令牌**（签名段解码→重编码）计算键：同一令牌的填充/空白/字母表变体共享一条吊销记录，无法换拼写绕过。
 
 ## 接入
 
