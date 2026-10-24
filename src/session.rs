@@ -90,6 +90,19 @@ impl SessionKeeper {
         )
     }
 
+    /// 用户级令牌版本键（多端登录时用来「一次踢掉全部令牌」）。
+    fn user_ver_key(&self, uid: i64) -> String {
+        format!("{}userver:{uid}", self.key_prefix)
+    }
+
+    /// 读当前用户令牌版本（无记录 = 0）。
+    fn user_ver(&self, store: &Arc<dyn SessionStore>, uid: i64) -> i64 {
+        store
+            .get(&self.user_ver_key(uid))
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
     /// 存储方式（`redis`-类的展示口径）。
     pub fn store_kind(&self) -> &'static str {
         match (&self.store, self.store.as_ref().map(|s| s.available())) {
@@ -118,8 +131,10 @@ impl SessionKeeper {
             0
         };
         let exp = if idle > 0 { now + idle } else { abs };
+        // 当前用户令牌版本：多端登录各自登记同一个版本；「踢线」= 版本 +1
+        let ver = self.user_ver(store, uid);
         let value = format!(
-            r#"{{"uid":{uid},"pwd":"{}","iat":{now},"abs":{abs},"exp":{exp}}}"#,
+            r#"{{"uid":{uid},"pwd":"{}","ver":{ver},"iat":{now},"abs":{abs},"exp":{exp}}}"#,
             escape(pwd_tag)
         );
         store.set(&self.key(token), &value, if idle > 0 { idle } else { abs })
@@ -154,6 +169,14 @@ impl SessionKeeper {
             .unwrap_or_default()
             .to_string();
 
+        // 用户级版本校验：踢线后（版本 +1）旧令牌全部失效——多端登录一次清掉
+        let uid = value.get("uid").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ver = value.get("ver").and_then(|v| v.as_i64()).unwrap_or(0);
+        if uid > 0 && ver != self.user_ver(store, uid) {
+            let _ = store.del(&self.key(token));
+            return SessionState::Invalid;
+        }
+
         // 滑动续期：剩余不足一半才重写，且不越过绝对上限
         if self.policy.idle_secs > 0 && exp - now < self.policy.idle_secs / 2 {
             let mut next = now + self.policy.idle_secs;
@@ -178,6 +201,26 @@ impl SessionKeeper {
             Some(store) if store.available() => store.del(&self.key(token)),
             _ => false,
         }
+    }
+
+    /// **踢掉某用户的全部令牌**（多端登录一次性下线）：版本 +1，不需遍历令牌。
+    ///
+    /// 版本键的 TTL 取绝对上限（≥ 会话寿命），避免版本键先过期后旧令牌“复活”。
+    /// 纯 JWT 模式返回 `false`（无共享存储，无法撤销——只能等过期或用改密/停用）。
+    pub fn revoke_user(&self, uid: i64) -> bool {
+        let Some(store) = &self.store else {
+            return false;
+        };
+        if !store.available() || uid <= 0 {
+            return false;
+        }
+        let next = self.user_ver(store, uid) + 1;
+        let ttl = if self.policy.max_secs > 0 {
+            self.policy.max_secs
+        } else {
+            self.policy.idle_secs.max(3600)
+        };
+        store.set(&self.user_ver_key(uid), &next.to_string(), ttl)
     }
 }
 
@@ -280,5 +323,47 @@ mod tests {
                 pwd_tag: String::new()
             }
         );
+    }
+
+    /// 多端登录：同一用户多个令牌，`revoke_user` 一次全部失效；之后重新登录仍可用。
+    #[test]
+    fn revoke_user_kills_all_devices() {
+        let (k, _s) = keeper(true);
+        k.register("pc", 42, "tag");
+        k.register("phone", 42, "tag");
+        k.register("other", 43, "tag");
+        assert_eq!(
+            k.check("pc"),
+            SessionState::Active {
+                pwd_tag: "tag".to_string()
+            }
+        );
+        assert!(k.revoke_user(42));
+        assert_eq!(k.check("pc"), SessionState::Invalid);
+        assert_eq!(k.check("phone"), SessionState::Invalid);
+        // 别的用户不受影响
+        assert_eq!(
+            k.check("other"),
+            SessionState::Active {
+                pwd_tag: "tag".to_string()
+            }
+        );
+        // 踢线后重新登录的新令牌版本已更新 → 正常可用
+        k.register("pc2", 42, "tag");
+        assert_eq!(
+            k.check("pc2"),
+            SessionState::Active {
+                pwd_tag: "tag".to_string()
+            }
+        );
+    }
+
+    /// 存储不可用时 `revoke_user` 不报错（回退纯 JWT，由调用方提示）。
+    #[test]
+    fn revoke_user_without_store_is_noop() {
+        let (k, _s) = keeper(false);
+        assert!(!k.revoke_user(1));
+        let k2 = SessionKeeper::new(None, "t:", SessionPolicy::default());
+        assert!(!k2.revoke_user(1));
     }
 }
