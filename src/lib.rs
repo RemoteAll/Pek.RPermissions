@@ -5,13 +5,16 @@
 //!
 //! - [`jwt`]：NewLife `JwtBuilder` 兼容 JWT（HS256，字节级互通；C# 黄金样本固化在单测）；
 //! - [`claims`]：标准 claims（`sub` / `name` / `from` / `clientType`）构造与解析；
-//! - [`revoke`]：内存吊销名单（登出即失效；重启清空——JWT 无状态会话的既定权衡）。
+//! - [`revoke`]：内存吊销名单（登出即失效；重启清空——JWT 无状态会话的既定权衡）；
+//! - [`session`]：**可插拔的会话登记/吊销**（JWT 始终生效；Redis/数据库只存“登记 + 吊销”，
+//!   存储不可用时自动退回纯 JWT；含滑动续期与绝对上限，消费方实现 [`session::SessionStore`]）。
 //!
 //! 互通验证：`Pek.RCard/tools/jwt-interop.ps1`（C# 真实 `NewLife.Web.JwtBuilder` ↔ 本库，双向互签互验）。
 
 pub mod claims;
 pub mod jwt;
 pub mod revoke;
+pub mod session;
 
 /// 当前 Unix 秒。
 pub(crate) fn now_ts() -> i64 {
